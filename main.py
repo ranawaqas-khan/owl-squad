@@ -1,31 +1,36 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
-from typing import List, Dict, Optional
+from typing import List
 import re, dns.resolver, smtplib, time, random, string
 from statistics import mean
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# =========================
+# FASTAPI INIT
+# =========================
 app = FastAPI(
-    title="Owl Squad Email Finder & Verifier",
+    title="Owl Squad Email Finder",
     version="1.0",
-    description="High-accuracy SMTP verifier + smart email finder with catch-all and entropy detection."
+    description="Finds real email using full SMTP verification with entropy + catch-all detection"
 )
 
 # =========================
-# CONFIG
+# ORIGINAL VERIFICATION LOGIC (AS PROVIDED)
 # =========================
 EMAIL_REGEX = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
 TIMEOUT = 5
 PAUSE_BETWEEN_PROBES = 0.1
 MAX_WORKERS_DEFAULT = 20
 
-FREE_PROVIDERS = {"gmail.com","yahoo.com","outlook.com","hotmail.com","icloud.com","aol.com","zoho.com","yandex.com"}
-DISPOSABLE_PROVIDERS = {"tempmail.com","mailinator.com","guerrillamail.com","10minutemail.com"}
+FREE_PROVIDERS = {
+    "gmail.com","yahoo.com","outlook.com","hotmail.com",
+    "icloud.com","aol.com","zoho.com","yandex.com"
+}
+DISPOSABLE_PROVIDERS = {
+    "tempmail.com","mailinator.com","guerrillamail.com","10minutemail.com"
+}
 ROLE_PREFIXES = {"info","admin","sales","support","contact","hr","help","team"}
 
-# =========================
-# UTILITIES
-# =========================
 def random_local(k=8):
     return ''.join(random.choices(string.ascii_lowercase + string.digits, k=k))
 
@@ -46,9 +51,6 @@ def classify_email(local:str, domain:str):
     if any(local.lower().startswith(p) for p in ROLE_PREFIXES): return "role"
     return "business"
 
-# =========================
-# SMTP MULTI-PROBE
-# =========================
 def smtp_multi_probe(mx:str, target_email:str):
     domain = target_email.split("@")[1]
     seq = [
@@ -60,9 +62,8 @@ def smtp_multi_probe(mx:str, target_email:str):
     try:
         s = smtplib.SMTP(timeout=TIMEOUT)
         s.connect(mx)
-        s.helo("owlsquad.app")
-        s.mail("probe@owlsquad.app")
-
+        s.helo("bounso.com")
+        s.mail("probe@bounso.com")
         for addr in seq:
             start = time.perf_counter()
             try:
@@ -73,27 +74,21 @@ def smtp_multi_probe(mx:str, target_email:str):
             msg = msg.decode() if isinstance(msg, bytes) else str(msg)
             results.append((addr, code, msg, latency))
             time.sleep(PAUSE_BETWEEN_PROBES)
-
         s.quit()
     except Exception as e:
         results.append(("__connect__", None, f"connect_error:{e}", None))
     return results
 
-# =========================
-# ANALYSIS
-# =========================
 def analyze_entropy_and_catchall(seq):
     codes = [c for _, c, *_ in seq if c is not None]
     msgs = [m[-80:] for *_, m, _ in seq if isinstance(m, str)]
     latencies = [t for *_, t in seq if isinstance(t, (int, float))]
     entropy = len(set(msgs))
     delta = int(max(latencies) - min(latencies)) if latencies else 0
-
     fake1, real, fake2 = codes[0], codes[1], codes[2]
     catch_all = (fake1 == 250 and fake2 == 250)
     flat_entropy = (entropy == 1)
     is_catch_all = catch_all or (flat_entropy and real == 250)
-
     return {
         "entropy": entropy,
         "delta": delta,
@@ -102,9 +97,6 @@ def analyze_entropy_and_catchall(seq):
         "avg_latency": int(mean(latencies)) if latencies else None
     }
 
-# =========================
-# MAIN VERIFY FUNCTION
-# =========================
 def verify_email(email:str):
     result = {
         "email": email,
@@ -154,9 +146,6 @@ def verify_email(email:str):
 
     return result
 
-# =========================
-# BULK VERIFICATION
-# =========================
 def verify_bulk_emails(emails, max_workers=MAX_WORKERS_DEFAULT):
     results = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -166,7 +155,7 @@ def verify_bulk_emails(emails, max_workers=MAX_WORKERS_DEFAULT):
     return results
 
 # =========================
-# EMAIL FINDER
+# EMAIL FINDER LOGIC
 # =========================
 def clean_name(full_name: str):
     return [re.sub(r'[^a-zA-Z]', '', p).lower() for p in full_name.strip().split() if p]
@@ -217,15 +206,8 @@ def find_email_for_person(full_name: str, domain: str, batch_size:int=10, max_wo
     return {"status":"not_found","email":None,"tried":tried}
 
 # =========================
-# FASTAPI ROUTES
+# FASTAPI ENDPOINT
 # =========================
-class SingleEmailRequest(BaseModel):
-    email: str
-
-class BulkEmailRequest(BaseModel):
-    emails: List[str]
-    max_workers: int = 20
-
 class FinderRequest(BaseModel):
     full_name: str
     domain: str
@@ -234,16 +216,7 @@ class FinderRequest(BaseModel):
 
 @app.get("/")
 def home():
-    return {"message":"🦉 Owl Squad API is live","version":"1.0"}
-
-@app.post("/verify")
-async def verify_single(req: SingleEmailRequest):
-    return {"count":1,"results":[verify_email(req.email)]}
-
-@app.post("/bulk")
-async def verify_bulk(req: BulkEmailRequest):
-    res = verify_bulk_emails(req.emails, req.max_workers)
-    return {"count":len(res),"results":res}
+    return {"message": "🦉 Owl Squad Email Finder is Live", "version": "1.0"}
 
 @app.post("/find")
 async def find_email(req: FinderRequest):
