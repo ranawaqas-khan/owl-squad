@@ -2,9 +2,9 @@ import re, dns.resolver, smtplib, time, random, string
 from statistics import mean
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# =========================
+# ==============================================
 # CONFIG
-# =========================
+# ==============================================
 EMAIL_REGEX = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
 TIMEOUT = 5
 PAUSE_BETWEEN_PROBES = 0.1
@@ -19,9 +19,9 @@ DISPOSABLE_PROVIDERS = {
 }
 ROLE_PREFIXES = {"info","admin","sales","support","contact","hr","help","team"}
 
-# =========================
+# ==============================================
 # UTILITIES
-# =========================
+# ==============================================
 def random_local(k=8):
     return ''.join(random.choices(string.ascii_lowercase + string.digits, k=k))
 
@@ -42,11 +42,11 @@ def classify_email(local:str, domain:str):
     if any(local.lower().startswith(p) for p in ROLE_PREFIXES): return "role"
     return "business"
 
-# =========================
+# ==============================================
 # SMTP MULTI-PROBE
-# =========================
+# ==============================================
 def smtp_multi_probe(mx:str, target_email:str):
-    """Sends 3 probes → fake1, real, fake2 to detect catch-all & timing"""
+    """Sends 3 probes → fake1, real, fake2 to detect catch-all & timing behavior"""
     domain = target_email.split("@")[1]
     seq = [
         f"{random_local()}@{domain}",
@@ -58,7 +58,7 @@ def smtp_multi_probe(mx:str, target_email:str):
         s = smtplib.SMTP(timeout=TIMEOUT)
         s.connect(mx)
         s.helo("gmail.com")
-        s.mail("vreify@gmail.com")
+        s.mail("verify@gmail.com")
 
         for addr in seq:
             start = time.perf_counter()
@@ -76,9 +76,9 @@ def smtp_multi_probe(mx:str, target_email:str):
         results.append(("__connect__", None, f"connect_error:{e}", None))
     return results
 
-# =========================
-# ANALYSIS: TIMING + ENTROPY + CATCH-ALL
-# =========================
+# ==============================================
+# ANALYSIS: ENTROPY + LATENCY + CATCH-ALL
+# ==============================================
 def analyze_entropy_and_catchall(seq):
     codes = [c for _, c, *_ in seq if c is not None]
     msgs = [m[-80:] for *_, m, _ in seq if isinstance(m, str)]
@@ -86,7 +86,7 @@ def analyze_entropy_and_catchall(seq):
     entropy = len(set(msgs))
     delta = int(max(latencies) - min(latencies)) if latencies else 0
 
-    fake1, real, fake2 = codes[0], codes[1], codes[2]
+    fake1, real, fake2 = codes[0] if len(codes)>0 else None, codes[1] if len(codes)>1 else None, codes[2] if len(codes)>2 else None
     catch_all = (fake1 == 250 and fake2 == 250)
     flat_entropy = (entropy == 1)
     is_catch_all = catch_all or (flat_entropy and real == 250)
@@ -99,9 +99,9 @@ def analyze_entropy_and_catchall(seq):
         "avg_latency": int(mean(latencies)) if latencies else None
     }
 
-# =========================
+# ==============================================
 # MAIN VERIFY FUNCTION
-# =========================
+# ==============================================
 def verify_email(email:str):
     result = {
         "email": email,
@@ -117,7 +117,8 @@ def verify_email(email:str):
             "is_disposable": None,
             "is_role_based": None,
             "is_government": None,
-            "is_catch_all": None
+            "is_catch_all": None,
+            "reasoning": None
         }
     }
 
@@ -133,7 +134,7 @@ def verify_email(email:str):
     result["details"]["is_role_based"] = (email_type == "role")
     result["details"]["is_government"] = (email_type == "government")
 
-    # MX Lookup
+    # MX lookup
     try:
         mx_records = [str(r.exchange).rstrip('.') for r in dns.resolver.resolve(domain, "MX")]
         result["mx_records"]["mx"] = mx_records
@@ -151,7 +152,7 @@ def verify_email(email:str):
     result["smtp"]["latency_ms"] = analysis["delta"]
     result["smtp"]["message"] = seq[1][2] if len(seq) > 1 else None
 
-    # Decision
+    # Decision logic
     if real_code == 250:
         result["status"] = "deliverable"
         result["deliverable"] = True
@@ -169,13 +170,16 @@ def verify_email(email:str):
 
     return result
 
-# =========================
-# BULK PARALLEL VERIFICATION
-# =========================
+# ==============================================
+# BULK PARALLEL VERIFICATION (OPTIONAL)
+# ==============================================
 def verify_bulk_emails(emails, max_workers=MAX_WORKERS_DEFAULT):
     results = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(verify_email, e): e for e in emails}
         for f in as_completed(futures):
-            results.append(f.result())
+            try:
+                results.append(f.result())
+            except Exception:
+                continue
     return results
