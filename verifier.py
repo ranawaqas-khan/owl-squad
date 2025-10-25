@@ -1,3 +1,12 @@
+import logging, sys
+
+logging.basicConfig(
+    stream=sys.stdout,          # 👈 log to console, visible in Railway logs
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+logging.info("✅ verifier.py loaded with console debug logging enabled.")
+
 import re
 import dns.resolver
 import smtplib
