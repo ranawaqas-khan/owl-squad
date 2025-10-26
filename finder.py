@@ -1,9 +1,18 @@
-from verifier import verify_email
-import concurrent.futures
+from verifier import verify_batch
+import re, logging, sys
 
-# ============================
-# PERSON-BASED PATTERNS
-# ============================
+# ---------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------
+logging.basicConfig(
+    stream=sys.stdout,
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+
+# ---------------------------------------------------------------------
+# Pattern Generators
+# ---------------------------------------------------------------------
 def generate_person_patterns(first, last, domain):
     f, l = first.lower().strip(), last.lower().strip()
     patterns = [
@@ -21,41 +30,71 @@ def generate_person_patterns(first, last, domain):
         f"{f}.{l[0]}@{domain}",
         f"{f[0]}{l[0]}@{domain}"
     ]
-    return list(dict.fromkeys(patterns))  # dedup
+    return list(dict.fromkeys(patterns))  # deduplicate
 
 
-# ============================
-# GENERIC COMPANY EMAILS
-# ============================
 def generate_generic_patterns(domain):
-    generic_prefixes = ["info", "support", "contact", "help", "hi", "hello", "team", "sales", "admin"]
-    return [f"{p}@{domain}" for p in generic_prefixes]
+    prefixes = ["info", "support", "contact", "help", "sales", "team", "hello", "hi", "admin"]
+    return [f"{p}@{domain}" for p in prefixes]
 
 
-# ============================
-# VERIFY CANDIDATES
-# ============================
-def verify_candidates(emails, max_workers=10):
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(verify_email, e): e for e in emails}
-        for f in concurrent.futures.as_completed(futures):
-            res = f.result()
-            if res.get("deliverable") and not res["details"].get("is_catch_all"):
-                return res
-    return None
+# ---------------------------------------------------------------------
+# Finder Logic
+# ---------------------------------------------------------------------
+def find_valid_email(first, last, domain):
+    """
+    Generates person + generic patterns, verifies all with timing analysis,
+    and returns best candidate (plus full diagnostic info).
+    """
+    domain = domain.strip().lower()
+    if not re.match(r"^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$", domain):
+        return {"status": "invalid_domain", "valid": False, "email": None}
 
-
-# ============================
-# MAIN FINDER
-# ============================
-def find_valid_email(first, last, domain, max_workers=10):
-    # 1️⃣ Try person-based patterns
+    # 1️⃣ Generate candidates
     person_emails = generate_person_patterns(first, last, domain)
-    found = verify_candidates(person_emails, max_workers)
+    generic_emails = generate_generic_patterns(domain)
+    all_candidates = person_emails + generic_emails
 
-    # 2️⃣ If not found → fallback to generic
-    if not found:
-        generic_emails = generate_generic_patterns(domain)
-        found = verify_candidates(generic_emails, max_workers)
+    logging.info(f"🧩 Generated {len(all_candidates)} patterns for {first} {last} @ {domain}")
 
-    return found
+    # 2️⃣ Verify all in batch using verifier logic
+    batch = verify_batch(all_candidates)
+    results = batch["results"]
+    chosen = batch["chosen"]
+
+    # 3️⃣ Prepare debug data
+    debug_info = [
+        {
+            "email": r["email"],
+            "code": r.get("smtp_code"),
+            "latency": r.get("latency"),
+            "deliverable": r.get("deliverable"),
+            "reason": r.get("reason"),
+            "mx": r.get("mx")
+        }
+        for r in results
+    ]
+
+    # 4️⃣ Decision
+    if chosen:
+        found = {
+            "status": "found",
+            "valid": True,
+            "email": chosen["email"],
+            "smtp_code": chosen.get("smtp_code"),
+            "latency": chosen.get("latency"),
+            "reason": chosen.get("reason"),
+            "mx": chosen.get("mx"),
+            "debug": debug_info
+        }
+        logging.info(f"✅ Found probable valid email: {chosen['email']}")
+        return found
+
+    # 5️⃣ Fallback
+    logging.warning("❌ No valid or likely candidate found.")
+    return {
+        "status": "not_found",
+        "valid": False,
+        "email": None,
+        "debug": debug_info
+    }
