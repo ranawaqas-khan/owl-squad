@@ -1,124 +1,157 @@
-import re, dns.resolver, smtplib, time, random, string, logging, sys
-from statistics import mean, stdev
+import re, dns.resolver, smtplib, time, random, string, logging
+from statistics import mean
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ---------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------
-logging.basicConfig(
-    stream=sys.stdout,
-    level=logging.DEBUG,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-
-# ---------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------
-EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+# =========================
+# CONFIG
+# =========================
+EMAIL_REGEX = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
 TIMEOUT = 5
-PAUSE = 0.1
+PAUSE_BETWEEN_PROBES = 0.1
+MAX_WORKERS_DEFAULT = 20
 
-# ---------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------
-def rand_local(n=8): return ''.join(random.choices(string.ascii_lowercase + string.digits, k=n))
+FREE_PROVIDERS = {
+    "gmail.com","yahoo.com","outlook.com","hotmail.com",
+    "icloud.com","aol.com","zoho.com","yandex.com"
+}
+DISPOSABLE_PROVIDERS = {
+    "tempmail.com","mailinator.com","guerrillamail.com","10minutemail.com"
+}
+ROLE_PREFIXES = {"info","admin","sales","support","contact","hr","help","team"}
 
-def get_mx(domain):
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+# =========================
+# UTILITIES
+# =========================
+def random_local(k=8):
+    return ''.join(random.choices(string.ascii_lowercase + string.digits, k=k))
+
+def detect_mx_provider(mx_host:str)->str:
+    h = mx_host.lower()
+    if "outlook" in h or "protection" in h:  return "microsoft365"
+    if "google" in h or "aspmx" in h:        return "google"
+    if "pphosted" in h:                      return "proofpoint"
+    if "mimecast" in h:                      return "mimecast"
+    if "barracuda" in h:                     return "barracuda"
+    return "unknown"
+
+def classify_email(local:str, domain:str):
+    d = domain.lower()
+    if d in FREE_PROVIDERS: return "free"
+    if any(d.endswith(dp) for dp in DISPOSABLE_PROVIDERS): return "disposable"
+    if d.endswith(".gov") or d.endswith(".gov.pk"): return "government"
+    if any(local.lower().startswith(p) for p in ROLE_PREFIXES): return "role"
+    return "business"
+
+# =========================
+# SMTP MULTI-PROBE
+# =========================
+def smtp_multi_probe(mx:str, target_email:str):
+    """Sends 3 probes → fake1, real, fake2 to detect catch-all & timing"""
+    domain = target_email.split("@")[1]
+    seq = [
+        f"{random_local()}@{domain}",
+        target_email,
+        f"{random_local()}@{domain}"
+    ]
+    results = []
     try:
-        records = [str(r.exchange).rstrip('.') for r in dns.resolver.resolve(domain, "MX")]
-        logging.debug(f"✅ MX for {domain}: {records}")
-        return records[0]
-    except Exception as e:
-        logging.error(f"❌ MX lookup failed for {domain}: {e}")
-        return None
+        s = smtplib.SMTP(timeout=TIMEOUT)
+        s.connect(mx)
+        s.helo("gmail.com")
+        s.mail("verify@bounso.com")
 
-def smtp_check(mx_host, email):
-    """Do one RCPT test and measure latency"""
-    try:
-        server = smtplib.SMTP(timeout=TIMEOUT)
-        server.connect(mx_host)
-        server.helo("gmail.com")
-        server.mail("probe@bounso.com")
-        t0 = time.perf_counter()
-        code, msg = server.rcpt(email)
-        latency = (time.perf_counter() - t0) * 1000
-        msg = msg.decode() if isinstance(msg, bytes) else str(msg)
-        server.quit()
-        return {"code": code, "msg": msg, "latency": round(latency, 2)}
-    except Exception as e:
-        logging.error(f"SMTP error for {email}: {e}")
-        return {"code": None, "msg": str(e), "latency": None}
+        for addr in seq:
+            start = time.perf_counter()
+            try:
+                code, msg = s.rcpt(addr)
+            except Exception as e:
+                code, msg = None, str(e)
+            latency = round((time.perf_counter() - start) * 1000, 2)
+            msg = msg.decode() if isinstance(msg, bytes) else str(msg)
+            results.append((addr, code, msg, latency))
+            time.sleep(PAUSE_BETWEEN_PROBES)
 
-# ---------------------------------------------------------------------
-# Core verification
-# ---------------------------------------------------------------------
-def verify_email(email):
-    result = {
-        "email": email,
-        "deliverable": False,
-        "status": "undeliverable",
-        "mx": None,
-        "latency": None,
-        "reason": None
+        s.quit()
+    except Exception as e:
+        results.append(("__connect__", None, f"connect_error:{e}", None))
+    return results
+
+# =========================
+# ANALYSIS
+# =========================
+def analyze_entropy_and_catchall(seq):
+    codes = [c for _, c, *_ in seq if c is not None]
+    msgs = [m[-80:] for *_, m, _ in seq if isinstance(m, str)]
+    latencies = [t for *_, t in seq if isinstance(t, (int, float))]
+    entropy = len(set(msgs))
+    delta = int(max(latencies) - min(latencies)) if latencies else 0
+
+    if len(codes) < 3:
+        return {"entropy": entropy, "delta": delta, "is_catch_all": None, "real_code": None, "avg_latency": None}
+
+    fake1, real, fake2 = codes[0], codes[1], codes[2]
+    catch_all = (fake1 == 250 and fake2 == 250)
+    flat_entropy = (entropy == 1)
+    is_catch_all = catch_all or (flat_entropy and real == 250)
+
+    return {
+        "entropy": entropy,
+        "delta": delta,
+        "is_catch_all": is_catch_all,
+        "real_code": real,
+        "avg_latency": int(mean(latencies)) if latencies else None
     }
 
-    if not EMAIL_RE.match(email):
-        result["reason"] = "invalid_format"
+# =========================
+# MAIN VERIFY FUNCTION
+# =========================
+def verify_email(email:str):
+    result = {
+        "email": email,
+        "status": "undeliverable",
+        "deliverable": False,
+        "verification_score": 0.0,
+        "mx_provider": "unknown",
+        "smtp": {},
+        "details": {}
+    }
+
+    try:
+        if not EMAIL_REGEX.match(email or ""):
+            result["details"]["reasoning"] = "bad_syntax"
+            return result
+
+        local, domain = email.split("@", 1)
+        email_type = classify_email(local, domain)
+        result["details"]["email_type"] = email_type
+
+        # MX lookup
+        mx_records = [str(r.exchange).rstrip('.') for r in dns.resolver.resolve(domain, "MX")]
+        result["mx_provider"] = detect_mx_provider(mx_records[0])
+
+        seq = smtp_multi_probe(mx_records[0], email)
+        analysis = analyze_entropy_and_catchall(seq)
+
+        result["smtp"]["seq"] = seq
+        result["smtp"]["analysis"] = analysis
+
+        code = analysis.get("real_code")
+        if code == 250:
+            result["status"] = "deliverable"
+            result["deliverable"] = True
+            result["verification_score"] = 0.98 if not analysis.get("is_catch_all") else 0.85
+        elif code == 550:
+            result["status"] = "undeliverable"
+        else:
+            result["status"] = "unknown"
+
+        result["details"]["is_catch_all"] = analysis.get("is_catch_all")
+        result["details"]["reasoning"] = f"smtp_code={code}"
+
         return result
 
-    local, domain = email.split("@", 1)
-    mx_host = get_mx(domain)
-    if not mx_host:
-        result["reason"] = "no_mx"
+    except Exception as e:
+        result["details"]["reasoning"] = f"error:{e}"
         return result
-
-    check = smtp_check(mx_host, email)
-    result.update({"mx": mx_host, "latency": check["latency"], "smtp_code": check["code"], "smtp_msg": check["msg"]})
-
-    if check["code"] == 250:
-        result["deliverable"] = True
-        result["status"] = "deliverable"
-        result["reason"] = "250_ok"
-    elif check["code"] == 550:
-        result["reason"] = "550_rejected"
-    else:
-        result["reason"] = "smtp_error"
-
-    logging.debug(f"🔍 {email} → {result['status']} ({result['reason']}) latency={result['latency']}ms")
-    return result
-
-
-# ---------------------------------------------------------------------
-# Batch comparison heuristic
-# ---------------------------------------------------------------------
-def verify_batch(candidates):
-    """
-    Test all candidates once each.
-    Detect likely real one on catch-all domains by timing variance.
-    """
-    results = []
-    for e in candidates:
-        res = verify_email(e)
-        results.append(res)
-        time.sleep(PAUSE)
-
-    # collect latencies
-    lats = [r["latency"] for r in results if r["latency"]]
-    avg = mean(lats) if lats else None
-    dev = stdev(lats) if len(lats) > 1 else 0
-
-    logging.debug(f"🧮 Timing stats: avg={avg:.2f if avg else 0}ms dev={dev:.2f}")
-
-    # heuristic: one email slower by >2× stdev = likely real on catch-all
-    chosen = None
-    if dev and dev > 0:
-        threshold = avg + 2 * dev
-        outliers = [r for r in results if r["latency"] and r["latency"] > threshold]
-        if outliers:
-            chosen = outliers[0]
-
-    # fallback: first true deliverable
-    if not chosen:
-        deliverables = [r for r in results if r["deliverable"]]
-        chosen = deliverables[0] if deliverables else None
-
-    return {"results": results, "chosen": chosen}
